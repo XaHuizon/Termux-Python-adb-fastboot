@@ -74,7 +74,20 @@ py-adb reboot bootloader
 py-adb stop
 ```
 
-`py-adb start` 会启动后台 daemon 并复用同一条 ADB 连接。后续 `devices`、`shell`、`push`、`pull` 都通过 daemon 完成。`shell`、`push`、`pull`、`reboot` 在 daemon 未运行时会自动启动它；`devices` 仍只扫描 USB 描述符，不会新建 ADB 连接。
+`py-adb start` 会启动后台 daemon 并复用同一条 ADB 连接，成功时输出：
+
+```text
+设备状态: device
+守护进程启动成功
+```
+
+`py-adb devices` 只输出状态和序列号，例如：
+
+```text
+device: abc1234
+```
+
+后续 `devices`、`shell`、`push`、`pull` 都通过 daemon 完成。`shell`、`push`、`pull`、`reboot` 在 daemon 未运行时会自动启动它；`devices` 仍只扫描 USB 描述符，不会新建 ADB 连接。
 
 `py-adb shell` 不带参数时进入逐行 REPL；命令之间不保留 `cd` 和环境变量。需要完整 shell 时使用：
 

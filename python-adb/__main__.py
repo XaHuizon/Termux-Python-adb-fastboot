@@ -27,24 +27,24 @@ CONFIG_DIR = Path.home() / ".config" / "termux-pyadb"
 SOCKET_PATH = CONFIG_DIR / "min.sock"
 LOG_PATH = CONFIG_DIR / "min-daemon.log"
 
-USAGE = """usage: py-adb COMMAND
+USAGE = """用法: py-adb 命令
 
-ADB over Termux USB.
+通过 Termux USB 使用 ADB。
 
-commands:
-  key                     show the ADB public key fingerprint
-  start                   start the background daemon
-  status                  show daemon/device status
-  devices                 list ADB devices
-  shell [COMMAND ...]     run a shell command, or start a line REPL
-  push LOCAL REMOTE       copy a file to the device
-  pull REMOTE LOCAL       copy a file from the device
-  reboot [TARGET]         reboot the device
-  stop                    stop the background daemon
-  daemon                  run the daemon in the foreground
+命令:
+  key                     显示 ADB 公钥指纹
+  start                   启动后台守护进程
+  status                  显示守护进程和设备状态
+  devices                 列出 ADB 设备
+  shell [命令 ...]         执行 shell 命令，或进入逐行 REPL
+  push 本地 远程           复制文件到设备
+  pull 远程 本地           从设备复制文件
+  reboot [目标]            重启设备
+  stop                    停止后台守护进程
+  daemon                  在前台运行守护进程
 
-environment:
-  termux-usb and Termux:API are required for USB access.
+环境:
+  需要 termux-usb 和 Termux:API 才能访问 USB。
 """
 
 
@@ -56,33 +56,44 @@ def fingerprints(key: RsaKey) -> dict[str, str]:
     }
 
 
+def error_text(exc: Exception) -> str:
+    text = str(exc)
+    if "termux-usb not found" in text:
+        return "未找到 termux-usb；请安装 Termux:API 并安装 Termux:API 应用"
+    if "timed out waiting for USB permission" in text:
+        return "等待 USB 权限超时，请允许 Termux 的 USB 访问请求"
+    if "USBDEVFS_CLAIMINTERFACE" in text and "busy" in text:
+        return "USB 接口被占用，请先停止 adb 或 termux-adb 服务"
+    return text
+
+
 def show_key() -> int:
     key = RsaKey.load_or_create()
     values = fingerprints(key)
-    print(f"key sha256={values['sha256']} md5={values['md5']} {key.comment}")
+    print(f"密钥 SHA256={values['sha256']} MD5={values['md5']} 用户={key.comment}")
     return 0
 
 
 def open_adb() -> tuple[AdbConnection, object]:
     paths = list_usb_devices()
     if not paths:
-        raise RuntimeError("no USB devices found")
+        raise RuntimeError("未找到 USB 设备")
     probes = []
     try:
         for path in paths:
             try:
                 info, usbfs = probe_device(path)
             except Exception as exc:
-                print(f"probe {path}: {exc}", file=sys.stderr)
+                print(f"探测 {path}: {error_text(exc)}", file=sys.stderr)
                 continue
             if "adb" in info.modes:
                 probes.append((info, usbfs))
             else:
                 usbfs.close()
         if not probes:
-            raise RuntimeError("no ADB USB device found")
+            raise RuntimeError("未找到 ADB USB 设备")
         if len(probes) > 1:
-            raise RuntimeError("multiple ADB USB devices; unplug one")
+            raise RuntimeError("发现多个 ADB USB 设备，请拔掉多余的设备")
         info, usbfs = probes[0]
         transport = open_transport_from_info(usbfs, info, "adb")
         key = RsaKey.load_or_create()
@@ -90,7 +101,7 @@ def open_adb() -> tuple[AdbConnection, object]:
         state = connection.connect(30.0)
         if state.state != "device":
             connection.close()
-            raise RuntimeError(f"ADB device is {state.state}")
+            raise RuntimeError(f"ADB 设备状态为 {state.state}")
         return connection, info
     except Exception:
         for _info, usbfs in probes:
@@ -106,14 +117,14 @@ def recv_json(sock: socket.socket) -> dict:
     while len(header) < 4:
         chunk = sock.recv(4 - len(header))
         if not chunk:
-            raise ConnectionError("client closed")
+            raise ConnectionError("连接已关闭")
         header += chunk
     length = struct.unpack(">I", header)[0]
     body = b""
     while len(body) < length:
         chunk = sock.recv(length - len(body))
         if not chunk:
-            raise ConnectionError("client closed")
+            raise ConnectionError("连接已关闭")
         body += chunk
     return json.loads(body.decode("utf-8"))
 
@@ -148,8 +159,8 @@ def run_daemon() -> int:
     os.chmod(SOCKET_PATH, 0o600)
     server.listen(4)
     print(
-        f"daemon ready {info.display_serial} "
-        f"key sha256={key_ids['sha256']} md5={key_ids['md5']}",
+        f"守护进程就绪 {info.display_serial} "
+        f"密钥 SHA256={key_ids['sha256']} MD5={key_ids['md5']}",
         flush=True,
     )
     try:
@@ -212,7 +223,7 @@ def run_daemon() -> int:
                     send_json(client, {"ok": True})
                     return 0
                 else:
-                    send_json(client, {"ok": False, "error": f"unknown op {op!r}"})
+                    send_json(client, {"ok": False, "error": f"未知操作 {op!r}"})
             except Exception as exc:
                 try:
                     send_json(client, {"ok": False, "error": str(exc)})
@@ -237,12 +248,17 @@ def request_started(payload: dict, timeout: float = 30.0) -> dict:
         return request(payload, timeout)
 
 
+def show_start_result(status: dict) -> None:
+    print(f"设备状态: {status.get('state', '?')}")
+    print("守护进程启动成功")
+
+
 def start_daemon(quiet: bool = False) -> int:
     try:
         status = request({"op": "status"}, 1.0)
         if status.get("ok"):
             if not quiet:
-                print(json.dumps(status, ensure_ascii=False))
+                show_start_result(status)
             return 0
     except OSError:
         pass
@@ -267,7 +283,7 @@ def start_daemon(quiet: bool = False) -> int:
     while time.monotonic() < deadline:
         if process.poll() is not None:
             detail = LOG_PATH.read_text(encoding="utf-8", errors="replace")[-2000:]
-            raise RuntimeError(f"daemon exited:\n{detail.strip()}")
+            raise RuntimeError(f"守护进程退出：\n{detail.strip()}")
         try:
             status = request({"op": "status"}, 1.0)
         except OSError:
@@ -275,10 +291,10 @@ def start_daemon(quiet: bool = False) -> int:
             continue
         if status.get("ok"):
             if not quiet:
-                print(json.dumps(status, ensure_ascii=False))
+                show_start_result(status)
             return 0
         time.sleep(0.2)
-    raise RuntimeError("timed out waiting for daemon")
+    raise RuntimeError("等待守护进程启动超时")
 
 
 def interactive_shell() -> int:
@@ -296,7 +312,7 @@ def interactive_shell() -> int:
             return 0
         result = request_started({"op": "shell", "command": command}, 60.0)
         if not result.get("ok"):
-            print(result.get("error", "shell failed"), file=sys.stderr)
+            print(result.get("error", "shell 执行失败"), file=sys.stderr)
             continue
         print(result.get("output", ""), end="")
 
@@ -307,11 +323,10 @@ def list_devices() -> int:
     except OSError:
         status = None
     if status is not None and status.get("ok"):
-        print("List of devices attached")
-        print(f"{status.get('serial', '?')}\t{status.get('state', '?')}")
+        print(f"{status.get('state', '?')}: {status.get('serial', '?')}")
         return 0
 
-    rows: list[tuple[str, str]] = []
+    rows: list[str] = []
     for path in list_usb_devices():
         try:
             info, usbfs = probe_device(path)
@@ -319,12 +334,21 @@ def list_devices() -> int:
             continue
         try:
             if "adb" in info.modes:
-                rows.append((info.display_serial, "offline"))
+                rows.append(f"offline: {info.display_serial}")
         finally:
             usbfs.close()
-    print("List of devices attached")
-    for serial, state in rows:
-        print(f"{serial}\t{state}")
+    for row in rows:
+        print(row)
+    return 0
+
+
+def show_status() -> int:
+    status = request({"op": "status"}, 10.0)
+    print(f"设备状态: {status.get('state', '?')}")
+    print(f"序列号: {status.get('serial', '?')}")
+    print(f"USB 路径: {status.get('path', '?')}")
+    print(f"密钥 SHA256: {status.get('key_sha256', '?')}")
+    print(f"密钥 MD5: {status.get('key_md5', '?')}")
     return 0
 
 
@@ -351,46 +375,46 @@ def main() -> int:
             target = sys.argv[2] if len(sys.argv) > 2 else ""
             result = request_started({"op": "reboot", "target": target}, 10.0)
             if not result.get("ok"):
-                raise RuntimeError(result.get("error", "reboot failed"))
-            print(f"reboot {target or 'system'} sent")
+                raise RuntimeError(result.get("error", "重启失败"))
+            print(f"已发送重启命令: {target or '系统'}")
             return 0
         if command == "status":
             try:
-                print(json.dumps(request({"op": "status"}), ensure_ascii=False))
+                return show_status()
             except OSError:
-                print("py-adb: daemon not running; run py-adb start", file=sys.stderr)
+                print("py-adb: 守护进程未运行，请先执行 py-adb start", file=sys.stderr)
                 return 1
-            return 0
         if command == "shell":
             if len(sys.argv) == 2:
                 return interactive_shell()
             result = request_started({"op": "shell", "command": " ".join(sys.argv[2:])}, 60.0)
             if not result.get("ok"):
-                raise RuntimeError(result.get("error", "shell failed"))
+                raise RuntimeError(result.get("error", "shell 执行失败"))
             print(result.get("output", ""), end="")
             return 0
         if command in ("push", "pull"):
             if len(sys.argv) < 4:
-                raise RuntimeError(f"usage: py-adb {command} SRC DST")
+                raise RuntimeError(f"用法: py-adb {command} 源 目标")
             if command == "push":
                 payload = {"op": "push", "local": sys.argv[2], "remote": sys.argv[3]}
             else:
                 payload = {"op": "pull", "remote": sys.argv[2], "local": sys.argv[3]}
             result = request_started(payload, 120.0)
             if not result.get("ok"):
-                raise RuntimeError(result.get("error", f"{command} failed"))
-            print(f"{command} ok")
+                raise RuntimeError(result.get("error", "推送失败" if command == "push" else "拉取失败"))
+            print("推送成功" if command == "push" else "拉取成功")
             return 0
         if command == "stop":
             try:
-                print(json.dumps(request({"op": "stop"}), ensure_ascii=False))
-            except OSError as exc:
-                print(f"not running: {exc}", file=sys.stderr)
+                request({"op": "stop"})
+            except OSError:
+                print("py-adb: 守护进程未运行", file=sys.stderr)
                 return 1
+            print("守护进程已停止")
             return 0
-        raise RuntimeError(f"unknown command {command!r}")
+        raise RuntimeError(f"未知命令: {command!r}")
     except Exception as exc:
-        print(f"py-adb: {exc}", file=sys.stderr)
+        print(f"py-adb: {error_text(exc)}", file=sys.stderr)
         return 1
 
 
