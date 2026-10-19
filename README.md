@@ -1,6 +1,8 @@
 # py-adb / py-fastboot
 
-纯 Python 实现的 ADB 和 Fastboot 工具，通过 Termux 的 `termux-usb` 获取 USB 文件描述符，直接使用 usbfs ioctl 和 ADB/Fastboot 协议通信。不依赖官方 `adb`/`fastboot`、`libusb` 或 `pyusb`。
+基于 Termux-API 的纯 Python adb/fastboot 工具，支持免 Root。
+
+通过 Termux 的 `termux-usb` 获取 USB 文件描述符，直接使用 usbfs ioctl 和 ADB/Fastboot 协议通信。不依赖官方 `adb`/`fastboot`、`libusb` 或 `pyusb`。
 
 项目包含两个独立的单文件 Python zipapp：
 
