@@ -229,6 +229,14 @@ def run_daemon() -> int:
         connection.close()
 
 
+def request_started(payload: dict, timeout: float = 30.0) -> dict:
+    try:
+        return request(payload, timeout)
+    except (FileNotFoundError, ConnectionRefusedError):
+        start_daemon(quiet=True)
+        return request(payload, timeout)
+
+
 def start_daemon(quiet: bool = False) -> int:
     try:
         status = request({"op": "status"}, 1.0)
@@ -274,6 +282,7 @@ def start_daemon(quiet: bool = False) -> int:
 
 
 def interactive_shell() -> int:
+    request_started({"op": "status"}, 1.0)
     while True:
         try:
             line = input("$ ")
@@ -285,7 +294,7 @@ def interactive_shell() -> int:
             continue
         if command in ("exit", "quit"):
             return 0
-        result = request({"op": "shell", "command": command}, 60.0)
+        result = request_started({"op": "shell", "command": command}, 60.0)
         if not result.get("ok"):
             print(result.get("error", "shell failed"), file=sys.stderr)
             continue
@@ -340,22 +349,22 @@ def main() -> int:
             return list_devices()
         if command == "reboot":
             target = sys.argv[2] if len(sys.argv) > 2 else ""
-            try:
-                result = request({"op": "reboot", "target": target}, 10.0)
-            except OSError:
-                start_daemon(quiet=True)
-                result = request({"op": "reboot", "target": target}, 10.0)
+            result = request_started({"op": "reboot", "target": target}, 10.0)
             if not result.get("ok"):
                 raise RuntimeError(result.get("error", "reboot failed"))
             print(f"reboot {target or 'system'} sent")
             return 0
         if command == "status":
-            print(json.dumps(request({"op": "status"}), ensure_ascii=False))
+            try:
+                print(json.dumps(request({"op": "status"}), ensure_ascii=False))
+            except OSError:
+                print("py-adb: daemon not running; run py-adb start", file=sys.stderr)
+                return 1
             return 0
         if command == "shell":
             if len(sys.argv) == 2:
                 return interactive_shell()
-            result = request({"op": "shell", "command": " ".join(sys.argv[2:])}, 60.0)
+            result = request_started({"op": "shell", "command": " ".join(sys.argv[2:])}, 60.0)
             if not result.get("ok"):
                 raise RuntimeError(result.get("error", "shell failed"))
             print(result.get("output", ""), end="")
@@ -367,7 +376,7 @@ def main() -> int:
                 payload = {"op": "push", "local": sys.argv[2], "remote": sys.argv[3]}
             else:
                 payload = {"op": "pull", "remote": sys.argv[2], "local": sys.argv[3]}
-            result = request(payload, 120.0)
+            result = request_started(payload, 120.0)
             if not result.get("ok"):
                 raise RuntimeError(result.get("error", f"{command} failed"))
             print(f"{command} ok")
