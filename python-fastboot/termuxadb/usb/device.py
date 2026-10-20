@@ -134,6 +134,10 @@ class UsbTransport:
         self.configuration_value = configuration_value
         self.in_endpoint = in_endpoint
         self.out_endpoint = out_endpoint
+        self.out_packet_size = 512
+        out_descriptor = interface.bulk_out
+        if out_descriptor is not None and out_descriptor.max_packet_size:
+            self.out_packet_size = max(1, out_descriptor.max_packet_size & 0x7FF)
         self._buffer = bytearray()
         self._closed = False
 
@@ -170,7 +174,10 @@ class UsbTransport:
     def write_all(self, data: bytes, timeout: int = 0) -> None:
         offset = 0
         while offset < len(data):
-            chunk = data[offset : offset + 16384]
+            chunk = data[offset : offset + USBFS_MAX_TRANSFER]
+            # 设备端只在收到短包时结束一次接收请求，长度正好是最大包长的整数倍会永久挂起
+            if len(chunk) % self.out_packet_size == 0:
+                chunk = chunk[:-1]
             sent = self.usbfs.bulk_write(self.out_endpoint, chunk, timeout)
             if sent <= 0:
                 raise UsbfsError("USB bulk write transferred no data", 5)

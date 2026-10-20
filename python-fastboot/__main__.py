@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+import time
+import unicodedata
+from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
@@ -29,6 +33,127 @@ USAGE = """用法: py-fastboot 命令
 环境:
   需要 termux-usb 和 Termux:API 才能访问 USB。
 """
+
+
+def _display_width(text: str) -> int:
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+
+
+def _clip_left(text: str, width: int) -> str:
+    """只保留尾部，超出宽度的前缀用省略号代替。"""
+    if _display_width(text) <= width:
+        return text
+    if width <= 1:
+        return "…"
+    kept: list[str] = []
+    used = 1
+    for ch in reversed(text):
+        step = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if used + step > width:
+            break
+        kept.append(ch)
+        used += step
+    return "…" + "".join(reversed(kept))
+
+
+def format_size(value: int) -> str:
+    size = float(max(value, 0))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1000 or unit == "GB":
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1000
+    return f"{size:.1f}GB"
+
+
+class ProgressBar:
+    MIN_BAR = 5
+    MAX_BAR = 30
+
+    def __init__(self, label: str, source: str, target: str):
+        self.label = label
+        self.source = source
+        self.target = target
+        self.started = False
+        self.drawn = False
+        self.started_at = 0.0
+        self.done = 0
+        self.total = 0
+
+    @staticmethod
+    def _interactive() -> bool:
+        try:
+            return bool(sys.stdout.isatty())
+        except (AttributeError, ValueError):
+            return False
+
+    def _bar_width(self) -> int:
+        columns = shutil.get_terminal_size((80, 24)).columns
+        return max(self.MIN_BAR, min(self.MAX_BAR, columns - 8))
+
+    def _header(self) -> str:
+        columns = shutil.get_terminal_size((80, 24)).columns
+        prefix = f"{self.label}: "
+        separator = " -> "
+        room = columns - _display_width(prefix) - _display_width(separator)
+        if room >= _display_width(self.source) + _display_width(self.target):
+            return f"{prefix}{self.source}{separator}{self.target}"
+        target = _clip_left(self.target, max(1, room // 2))
+        source = _clip_left(self.source, max(1, room - _display_width(target)))
+        return f"{prefix}{source}{separator}{target}"
+
+    def _bar_line(self, width: int) -> str:
+        ratio = 0.0 if self.total <= 0 else min(self.done / self.total, 1.0)
+        filled = int(ratio * width)
+        return "[" + "#" * filled + "-" * (width - filled) + f"][{ratio * 100:3.0f}%]"
+
+    def _stats_line(self) -> str:
+        if self.total <= 0:
+            return f"- {format_size(self.done)}"
+        elapsed = time.monotonic() - self.started_at
+        speed = self.done / elapsed / 1_000_000 if elapsed > 0.05 else 0.0
+        return f"- {format_size(self.done)}/{format_size(self.total)}  {speed:.1f}MB/s"
+
+    def _redraw(self, bar_line: str, stats_line: str) -> None:
+        if not self.drawn:
+            sys.stdout.write(bar_line + "\n" + stats_line)
+            self.drawn = True
+        else:
+            sys.stdout.write("\r\x1b[2K\x1b[1A\r\x1b[2K" + bar_line + "\n" + stats_line)
+        sys.stdout.flush()
+
+    def update(self, done: int, total: int) -> None:
+        if not self.started:
+            self.started = True
+            self.started_at = time.monotonic()
+            if self._interactive():
+                print(self._header(), flush=True)
+        self.done = max(0, int(done))
+        self.total = max(0, int(total))
+        if self._interactive():
+            self._redraw(self._bar_line(self._bar_width()), self._stats_line())
+
+    def finish(self, message: Optional[str] = None) -> None:
+        if not self.started:
+            if message:
+                print(message)
+            return
+        self.started = False
+        if not self._interactive():
+            if message:
+                print(message)
+            return
+        bar_line = self._bar_line(self._bar_width())
+        self._redraw(bar_line, self._stats_line())
+        sys.stdout.write("\n")
+        if message:
+            # [OKAY] 的右边缘与进度条右边缘对齐
+            room = _display_width(bar_line) - _display_width(message) - 8
+            if room >= 1:
+                sys.stdout.write(f"{message} {'.' * room} [OKAY]\n")
+            else:
+                sys.stdout.write(f"{message} [OKAY]\n")
+        sys.stdout.flush()
+        self.drawn = False
 
 
 def error_text(exc: Exception) -> str:
@@ -184,11 +309,16 @@ def fastboot_command(args: list[str]) -> int:
         partition = args[1]
         image = args[2]
         client, _info = open_fastboot()
+        bar = ProgressBar("刷写", os.path.basename(image), partition)
         try:
-            client.flash(partition, image)
+            client.flash(partition, image, progress=bar.update)
+        except Exception:
+            bar.finish()
+            raise
+        else:
+            bar.finish(f"刷写成功: {partition}")
         finally:
             client.close()
-        print(f"刷写成功: {partition}")
         return 0
     if action in ("reboot", "reboot-bootloader"):
         mode = "bootloader" if action == "reboot-bootloader" else ""
@@ -197,7 +327,7 @@ def fastboot_command(args: list[str]) -> int:
             client.reboot(mode)
         finally:
             client.close()
-        print(f"已发送重启命令: {mode or '系统'}")
+        print(f"- 已发送重启命令: [{mode or '系统'}]")
         return 0
     raise RuntimeError(f"未知命令: {action!r}")
 

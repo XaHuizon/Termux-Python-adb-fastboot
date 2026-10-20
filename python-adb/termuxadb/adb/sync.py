@@ -69,15 +69,16 @@ class SyncClient:
 
     def stat(self, path: str) -> FileStat:
         self._send_request(ID_STAT, path)
-        request_id, length = self._read_header()
+        header = self.stream.read_exact(8)
+        request_id = header[:4]
+        mode = struct.unpack_from("<I", header, 4)[0]
         if request_id == ID_FAIL:
-            self._read_failure(length)
-        if request_id != ID_STAT or length < 12:
+            self._read_failure(mode)
+        if request_id != ID_STAT:
             raise SyncError(f"unexpected sync stat response: {request_id!r}")
-        mode, size, mtime = struct.unpack("<III", self.stream.read_exact(12))
-        name_length = length - 12
-        name = self.stream.read_exact(name_length).decode("utf-8", errors="replace")
-        return FileStat(name=name, mode=mode, size=size, mtime=mtime)
+        # STAT 回复固定 16 字节，第二字段是 mode 而不是包长
+        size, mtime = struct.unpack("<II", self.stream.read_exact(8))
+        return FileStat(name=Path(path).name, mode=mode, size=size, mtime=mtime)
 
     def listdir(self, path: str) -> list[DirectoryEntry]:
         self._send_request(ID_LIST, path)
@@ -109,12 +110,12 @@ class SyncClient:
         done = 0
         if progress is not None:
             progress(done, total)
+        path_and_mode = f"{remote_path},{mode}".encode("utf-8")
+        self.stream.send(ID_SEND + struct.pack("<I", len(path_and_mode)) + path_and_mode)
         chunk_size = SYNC_DATA_MAX
         connection = getattr(self.stream, "connection", None)
         if connection is not None:
             chunk_size = max(1, min(chunk_size, connection.max_payload - 8))
-        path_and_mode = f"{remote_path},{mode}".encode("utf-8")
-        self.stream.send(ID_SEND + struct.pack("<I", len(path_and_mode)) + path_and_mode)
         with open(local_path, "rb") as handle:
             while True:
                 chunk = handle.read(chunk_size)
@@ -156,14 +157,11 @@ class SyncClient:
                     self._read_failure(length)
                 if request_id != ID_DATA:
                     raise SyncError(f"unexpected sync recv response: {request_id!r}")
-                remaining = length
-                while remaining:
-                    chunk = self.stream.read_exact(min(remaining, SYNC_DATA_MAX))
-                    handle.write(chunk)
-                    remaining -= len(chunk)
-                    done += len(chunk)
-                    if progress is not None:
-                        progress(done, total)
+                data = self.stream.read_exact(length)
+                handle.write(data)
+                done += len(data)
+                if progress is not None:
+                    progress(done, total)
 
     def quit(self) -> None:
         try:

@@ -87,7 +87,7 @@ py-adb stop
 device: abc1234
 ```
 
-除 `start`、`stop`、`daemon`、`help`、`version` 外，其他命令在 daemon 未运行时会自动启动它，并且不显示启动提示。`push`/`pull` 会显示类似 pip 的传输进度条。
+除 `start`、`stop`、`daemon`、`help`、`version` 外，其他命令在 daemon 未运行时会自动启动它，并且不显示启动提示。`push`/`pull` 会显示源与目标、进度条、已传输大小和速度，成功后输出带 `[OKAY]` 的结束行；`py-fastboot flash` 使用相同样式。
 
 `py-adb shell` 不带参数时进入逐行 REPL；命令之间不保留 `cd` 和环境变量。需要完整 shell 时使用：
 

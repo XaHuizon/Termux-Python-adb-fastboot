@@ -62,12 +62,9 @@ class SyncTests(unittest.TestCase):
     def test_pull_progress(self):
         path = "/sdcard/file.txt"
         data = b"hello"
-        name = b"file.txt"
-        stat_payload = struct.pack("<III", 0o100644, len(data), 123) + name
         incoming = (
             b"STAT"
-            + struct.pack("<I", len(stat_payload))
-            + stat_payload
+            + struct.pack("<III", 0o100644, len(data), 123)
             + b"DATA"
             + struct.pack("<I", len(data))
             + data
@@ -88,12 +85,12 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(progress[-1], (5, 5))
 
     def test_stat(self):
-        name = b"file.txt"
-        payload = struct.pack("<III", 0o100644, 5, 123) + name
-        incoming = b"STAT" + struct.pack("<I", len(payload)) + payload
+        payload = struct.pack("<III", 0o100644, 5, 123)
+        incoming = b"STAT" + payload
         stream = FakeStream(incoming)
         result = SyncClient(stream).stat("/sdcard/file.txt")
         self.assertEqual(result.name, "file.txt")
+        self.assertEqual(result.mode, 0o100644)
         self.assertEqual(result.size, 5)
         self.assertEqual(result.mtime, 123)
 

@@ -22,7 +22,7 @@ class FakeClient:
         self.closed = False
         self.callback = None
 
-    def flash(self, partition, image):
+    def flash(self, partition, image, progress=None):
         self.flashed = (partition, image)
 
     def command(self, command, timeout=0):

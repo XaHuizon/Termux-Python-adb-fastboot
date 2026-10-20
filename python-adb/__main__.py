@@ -4,12 +4,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import signal
 import socket
 import struct
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -154,6 +156,16 @@ def request(
         sock.close()
 
 
+def progress_sender(client: socket.socket) -> Callable[[int, int], None]:
+    def send(done: int, total: int) -> None:
+        try:
+            send_json(client, {"progress": {"done": done, "total": total}})
+        except OSError:
+            pass
+
+    return send
+
+
 def run_daemon() -> int:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
@@ -210,26 +222,22 @@ def run_daemon() -> int:
                 elif op == "push":
                     local_path = str(request_value.get("local") or "")
                     remote_path = str(request_value.get("remote") or "")
-
-                    def progress(done: int, total: int) -> None:
-                        try:
-                            send_json(client, {"progress": {"done": done, "total": total}})
-                        except OSError:
-                            pass
-
-                    push_file(connection, local_path, remote_path, progress=progress)
+                    push_file(
+                        connection,
+                        local_path,
+                        remote_path,
+                        progress=progress_sender(client),
+                    )
                     send_json(client, {"ok": True})
                 elif op == "pull":
                     remote_path = str(request_value.get("remote") or "")
                     local_path = str(request_value.get("local") or "")
-
-                    def progress(done: int, total: int) -> None:
-                        try:
-                            send_json(client, {"progress": {"done": done, "total": total}})
-                        except OSError:
-                            pass
-
-                    pull_file(connection, remote_path, local_path, progress=progress)
+                    pull_file(
+                        connection,
+                        remote_path,
+                        local_path,
+                        progress=progress_sender(client),
+                    )
                     send_json(client, {"ok": True})
                 elif op == "shell":
                     command = str(request_value.get("command") or "")
@@ -346,41 +354,125 @@ def interactive_shell() -> int:
         print(result.get("output", ""), end="")
 
 
-def format_bytes(value: int) -> str:
+def _display_width(text: str) -> int:
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+
+
+def _clip_left(text: str, width: int) -> str:
+    """只保留尾部，超出宽度的前缀用省略号代替。"""
+    if _display_width(text) <= width:
+        return text
+    if width <= 1:
+        return "…"
+    kept: list[str] = []
+    used = 1
+    for ch in reversed(text):
+        step = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if used + step > width:
+            break
+        kept.append(ch)
+        used += step
+    return "…" + "".join(reversed(kept))
+
+
+def format_size(value: int) -> str:
     size = float(max(value, 0))
-    for unit in ("B", "KiB", "MiB", "GiB"):
-        if size < 1024 or unit == "GiB":
-            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{size:.1f} GiB"
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1000 or unit == "GB":
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1000
+    return f"{size:.1f}GB"
 
 
 class ProgressBar:
-    def __init__(self, label: str):
+    MIN_BAR = 5
+    MAX_BAR = 30
+
+    def __init__(self, label: str, source: str, target: str):
         self.label = label
+        self.source = source
+        self.target = target
         self.started = False
+        self.drawn = False
+        self.started_at = 0.0
+        self.done = 0
+        self.total = 0
+
+    @staticmethod
+    def _interactive() -> bool:
+        try:
+            return bool(sys.stdout.isatty())
+        except (AttributeError, ValueError):
+            return False
+
+    def _bar_width(self) -> int:
+        columns = shutil.get_terminal_size((80, 24)).columns
+        return max(self.MIN_BAR, min(self.MAX_BAR, columns - 8))
+
+    def _header(self) -> str:
+        columns = shutil.get_terminal_size((80, 24)).columns
+        prefix = f"{self.label}: "
+        separator = " -> "
+        room = columns - _display_width(prefix) - _display_width(separator)
+        if room >= _display_width(self.source) + _display_width(self.target):
+            return f"{prefix}{self.source}{separator}{self.target}"
+        target = _clip_left(self.target, max(1, room // 2))
+        source = _clip_left(self.source, max(1, room - _display_width(target)))
+        return f"{prefix}{source}{separator}{target}"
+
+    def _bar_line(self, width: int) -> str:
+        ratio = 0.0 if self.total <= 0 else min(self.done / self.total, 1.0)
+        filled = int(ratio * width)
+        return "[" + "#" * filled + "-" * (width - filled) + f"][{ratio * 100:3.0f}%]"
+
+    def _stats_line(self) -> str:
+        if self.total <= 0:
+            return f"- {format_size(self.done)}"
+        elapsed = time.monotonic() - self.started_at
+        speed = self.done / elapsed / 1_000_000 if elapsed > 0.05 else 0.0
+        return f"- {format_size(self.done)}/{format_size(self.total)}  {speed:.1f}MB/s"
+
+    def _redraw(self, bar_line: str, stats_line: str) -> None:
+        if not self.drawn:
+            sys.stdout.write(bar_line + "\n" + stats_line)
+            self.drawn = True
+        else:
+            sys.stdout.write("\r\x1b[2K\x1b[1A\r\x1b[2K" + bar_line + "\n" + stats_line)
+        sys.stdout.flush()
 
     def update(self, value: dict) -> None:
-        done = int(value.get("done", 0))
-        total = int(value.get("total", 0))
-        self.started = True
-        if total > 0:
-            ratio = min(done / total, 1.0)
-            width = 30
-            filled = int(ratio * width)
-            bar = "#" * filled + "-" * (width - filled)
-            line = (
-                f"{self.label} {ratio * 100:3.0f}% [{bar}] "
-                f"{format_bytes(done)}/{format_bytes(total)}"
-            )
-        else:
-            line = f"{self.label} {format_bytes(done)}"
-        print(f"\r{line}", end="", flush=True)
+        if not self.started:
+            self.started = True
+            self.started_at = time.monotonic()
+            if self._interactive():
+                print(self._header(), flush=True)
+        self.done = max(0, int(value.get("done", 0)))
+        self.total = max(0, int(value.get("total", 0)))
+        if self._interactive():
+            self._redraw(self._bar_line(self._bar_width()), self._stats_line())
 
-    def finish(self) -> None:
-        if self.started:
-            print()
-            self.started = False
+    def finish(self, message: Optional[str] = None) -> None:
+        if not self.started:
+            if message:
+                print(message)
+            return
+        self.started = False
+        if not self._interactive():
+            if message:
+                print(message)
+            return
+        bar_line = self._bar_line(self._bar_width())
+        self._redraw(bar_line, self._stats_line())
+        sys.stdout.write("\n")
+        if message:
+            # [OKAY] 的右边缘与进度条右边缘对齐
+            room = _display_width(bar_line) - _display_width(message) - 8
+            if room >= 1:
+                sys.stdout.write(f"{message} {'.' * room} [OKAY]\n")
+            else:
+                sys.stdout.write(f"{message} [OKAY]\n")
+        sys.stdout.flush()
+        self.drawn = False
 
 
 def list_devices() -> int:
@@ -422,7 +514,7 @@ def main() -> int:
             result = request_started({"op": "reboot", "target": target}, 10.0)
             if not result.get("ok"):
                 raise RuntimeError(result.get("error", "重启失败"))
-            print(f"已发送重启命令: {target or '系统'}")
+            print(f"- 已发送重启命令: [{target or '系统'}]")
             return 0
         if command == "status":
             return show_status()
@@ -439,16 +531,21 @@ def main() -> int:
                 raise RuntimeError(f"用法: py-adb {command} 源 目标")
             if command == "push":
                 payload = {"op": "push", "local": sys.argv[2], "remote": sys.argv[3]}
+                bar = ProgressBar("推送", os.path.basename(sys.argv[2]), sys.argv[3])
+                ok_text, fail_text = "推送成功", "推送失败"
             else:
                 payload = {"op": "pull", "remote": sys.argv[2], "local": sys.argv[3]}
-            bar = ProgressBar("推送" if command == "push" else "拉取")
+                bar = ProgressBar("拉取", sys.argv[2], sys.argv[3])
+                ok_text, fail_text = "拉取成功", "拉取失败"
+            message: Optional[str] = None
             try:
-                result = request_started(payload, 120.0, bar.update)
+                result = request_started(payload, 1800.0, bar.update)
+                if result.get("ok"):
+                    message = ok_text
             finally:
-                bar.finish()
-            if not result.get("ok"):
-                raise RuntimeError(result.get("error", "推送失败" if command == "push" else "拉取失败"))
-            print("推送成功" if command == "push" else "拉取成功")
+                bar.finish(message)
+            if message is None:
+                raise RuntimeError(result.get("error", fail_text))
             return 0
         if command == "stop":
             try:

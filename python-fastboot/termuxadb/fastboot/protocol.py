@@ -126,7 +126,12 @@ class FastbootClient:
             except ValueError:
                 return None
 
-    def download_file(self, image_path: str, timeout: int = 60000) -> None:
+    def download_file(
+        self,
+        image_path: str,
+        timeout: int = 60000,
+        progress: Optional[Callable[[int, int], None]] = None,
+    ) -> None:
         path = Path(image_path)
         if not path.is_file():
             raise FastbootError(f"image not found: {image_path}")
@@ -151,16 +156,28 @@ class FastbootClient:
             raise FastbootError(
                 f"Fastboot requested {expected} bytes but image has {size} bytes"
             )
+        sent = 0
+        if progress is not None:
+            progress(sent, size)
         with open(path, "rb") as handle:
             while True:
                 chunk = handle.read(FASTBOOT_DATA_CHUNK)
                 if not chunk:
                     break
                 self.transport.write_all(chunk, timeout)
+                sent += len(chunk)
+                if progress is not None:
+                    progress(sent, size)
         self._read_until_terminal(timeout)
 
-    def flash(self, partition: str, image_path: str, timeout: int = 60000) -> bytes:
-        self.download_file(image_path, timeout)
+    def flash(
+        self,
+        partition: str,
+        image_path: str,
+        timeout: int = 60000,
+        progress: Optional[Callable[[int, int], None]] = None,
+    ) -> bytes:
+        self.download_file(image_path, timeout, progress=progress)
         return self.command(f"flash:{partition}", timeout)
 
     def reboot(self, mode: str = "", timeout: int = 2000) -> None:
