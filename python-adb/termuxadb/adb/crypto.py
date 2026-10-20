@@ -135,14 +135,33 @@ def _json_key_path() -> Path:
     return Path.home() / ".config" / "termux-pyadb" / "adbkey.json"
 
 
+def _key_choice_path() -> Path:
+    return Path.home() / ".config" / "termux-pyadb" / "key_path"
+
+
 def default_key_path() -> Path:
     override = os.environ.get("PYADB_KEY")
     if override:
         return Path(override).expanduser()
+
+    choice_path = _key_choice_path()
+    try:
+        selected = Path(choice_path.read_text(encoding="utf-8").strip()).expanduser()
+    except OSError:
+        selected = None
+    if selected is not None and selected.is_file():
+        return selected
+
     android_key = Path.home() / ".android" / "adbkey"
-    if android_key.is_file():
-        return android_key
-    return _json_key_path()
+    json_key = _json_key_path()
+    chosen = android_key if android_key.is_file() else json_key
+    try:
+        choice_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        choice_path.write_text(str(chosen) + "\n", encoding="utf-8")
+        os.chmod(choice_path, 0o600)
+    except OSError:
+        pass
+    return chosen
 
 
 def _der_tlv(data: bytes, offset: int) -> tuple[int, bytes, int]:

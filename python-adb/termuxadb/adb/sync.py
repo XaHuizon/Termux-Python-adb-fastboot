@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import os
 import struct
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .transport import AdbStream
 
@@ -102,15 +103,27 @@ class SyncClient:
         remote_path: str,
         mode: int = DEFAULT_FILE_MODE,
         mtime: Optional[int] = None,
+        progress: Optional[Callable[[int, int], None]] = None,
     ) -> None:
+        total = os.path.getsize(local_path)
+        done = 0
+        if progress is not None:
+            progress(done, total)
+        chunk_size = SYNC_DATA_MAX
+        connection = getattr(self.stream, "connection", None)
+        if connection is not None:
+            chunk_size = max(1, min(chunk_size, connection.max_payload - 8))
         path_and_mode = f"{remote_path},{mode}".encode("utf-8")
         self.stream.send(ID_SEND + struct.pack("<I", len(path_and_mode)) + path_and_mode)
         with open(local_path, "rb") as handle:
             while True:
-                chunk = handle.read(SYNC_DATA_MAX)
+                chunk = handle.read(chunk_size)
                 if not chunk:
                     break
                 self.stream.send(ID_DATA + struct.pack("<I", len(chunk)) + chunk)
+                done += len(chunk)
+                if progress is not None:
+                    progress(done, total)
         timestamp = int(time.time()) if mtime is None else int(mtime)
         self.stream.send(ID_DONE + struct.pack("<I", timestamp & 0xFFFFFFFF))
         request_id, length = self._read_header()
@@ -119,7 +132,17 @@ class SyncClient:
         if request_id != ID_OKAY:
             raise SyncError(f"unexpected sync send response: {request_id!r}")
 
-    def pull(self, remote_path: str, local_path: str) -> None:
+    def pull(
+        self,
+        remote_path: str,
+        local_path: str,
+        progress: Optional[Callable[[int, int], None]] = None,
+    ) -> None:
+        total = 0
+        done = 0
+        if progress is not None:
+            total = self.stat(remote_path).size
+            progress(done, total)
         self._send_request(ID_RECV, remote_path)
         destination = Path(local_path)
         if destination.parent and not destination.parent.exists():
@@ -138,6 +161,9 @@ class SyncClient:
                     chunk = self.stream.read_exact(min(remaining, SYNC_DATA_MAX))
                     handle.write(chunk)
                     remaining -= len(chunk)
+                    done += len(chunk)
+                    if progress is not None:
+                        progress(done, total)
 
     def quit(self) -> None:
         try:
@@ -155,21 +181,27 @@ def push_file(
     local_path: str,
     remote_path: str,
     mode: int = DEFAULT_FILE_MODE,
+    progress: Optional[Callable[[int, int], None]] = None,
 ) -> None:
     stream = _sync_stream(connection)
     client = SyncClient(stream)
     try:
-        client.push(local_path, remote_path, mode)
+        client.push(local_path, remote_path, mode, progress=progress)
         client.quit()
     finally:
         stream.close()
 
 
-def pull_file(connection, remote_path: str, local_path: str) -> None:
+def pull_file(
+    connection,
+    remote_path: str,
+    local_path: str,
+    progress: Optional[Callable[[int, int], None]] = None,
+) -> None:
     stream = _sync_stream(connection)
     client = SyncClient(stream)
     try:
-        client.pull(remote_path, local_path)
+        client.pull(remote_path, local_path, progress=progress)
         client.quit()
     finally:
         stream.close()

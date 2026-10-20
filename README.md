@@ -64,7 +64,6 @@ termux-adb kill-server
 ## ADB 使用
 
 ```bash
-py-adb key
 py-adb start
 py-adb devices
 py-adb status
@@ -79,8 +78,7 @@ py-adb stop
 `py-adb start` 会启动后台 daemon 并复用同一条 ADB 连接，成功时输出：
 
 ```text
-设备状态: device
-守护进程启动成功
+ - 守护进程已启动 [设备状态: device]
 ```
 
 `py-adb devices` 只输出状态和序列号，例如：
@@ -89,15 +87,13 @@ py-adb stop
 device: abc1234
 ```
 
-后续 `devices`、`shell`、`push`、`pull` 都通过 daemon 完成。`shell`、`push`、`pull`、`reboot` 在 daemon 未运行时会自动启动它；`devices` 仍只扫描 USB 描述符，不会新建 ADB 连接。
+除 `start`、`stop`、`daemon`、`help`、`version` 外，其他命令在 daemon 未运行时会自动启动它，并且不显示启动提示。`push`/`pull` 会显示类似 pip 的传输进度条。
 
 `py-adb shell` 不带参数时进入逐行 REPL；命令之间不保留 `cd` 和环境变量。需要完整 shell 时使用：
 
 ```bash
 py-adb shell "sh -c 'cd /sdcard && ls'"
 ```
-
-`py-adb devices` 在没有 daemon 时只读取 USB 描述符，状态显示为 `offline`，不会建立新的 ADB 连接。
 
 ## Fastboot 使用
 
@@ -114,11 +110,19 @@ py-fastboot devices
 py-fastboot getvar product
 py-fastboot getvar all
 py-fastboot info
+py-fastboot info unlocked
+py-fastboot flash boot boot.img
 py-fastboot reboot
 py-fastboot reboot-bootloader
 ```
 
-`info` 和 `getvar all` 会逐行输出 bootloader 返回的全部 INFO 变量，包括分区表、`serialno`、`product`、`unlocked`、`secure`、`max-download-size` 等。
+`py-fastboot devices` 输出格式与 `py-adb devices` 一致：
+
+```text
+fastboot: abc1234
+```
+
+`info` 和 `getvar all` 会逐行输出 bootloader 返回的全部 INFO 变量，包括分区表、`serialno`、`product`、`unlocked`、`secure`、`max-download-size` 等。`info` 后可以跟关键词过滤，采用子串匹配，例如 `py-fastboot info lock` 只输出包含 `lock` 的行（如 `unlocked: yes`）。输出会自动把 `key:value` 规范为 `key: value`。
 
 Fastboot 模式切换后 USB 设备路径会变化，Termux 可能再次请求宿主 USB 权限；这是 `termux-usb` 权限，不是 ADB RSA 授权。
 
@@ -162,11 +166,12 @@ cd ../python-fastboot && python3 -m unittest discover -s tests -v
 
 ## 说明
 
-- ADB 密钥默认复用 `~/.android/adbkey` 和 `~/.android/adbkey.pub`。
+- ADB 密钥默认复用 `~/.android/adbkey` 和 `~/.android/adbkey.pub`；首次选择后会记录在 `~/.config/termux-pyadb/key_path`，避免后续在 Android 密钥和 JSON 密钥之间切换导致重复授权。`py-adb status` 会显示当前 `密钥文件`、SHA256 和 MD5。
 - daemon socket 默认在 `~/.config/termux-pyadb/min.sock`。
 - 目标设备的 `/data/misc/adb/adb_keys` 中需要包含当前公钥；如果已包含，正常握手不会重复弹出 RSA 授权。
 - 如果 pyadb 启动时报接口忙，先停止官方 `adb`/`termux-adb` server，而不是强制 detach USB 驱动。
-- 当前 CLI 未暴露 Fastboot 刷写命令；`py-fastboot` 只提供查询和重启。
+- `py-fastboot flash 分区 镜像` 使用 Fastboot download/flash 流程。
+- `py-fastboot` 的帮助、错误和操作结果均为中文；Fastboot 变量名和值保持原始英文。
 
 ## License
 

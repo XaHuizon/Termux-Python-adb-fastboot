@@ -26,14 +26,21 @@ class SyncTests(unittest.TestCase):
     def test_push(self):
         stream = FakeStream(b"OKAY" + struct.pack("<I", 0))
         client = SyncClient(stream)
+        progress = []
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "file.txt"
             path.write_bytes(b"hello")
-            client.push(str(path), "/sdcard/file.txt")
+            client.push(
+                str(path),
+                "/sdcard/file.txt",
+                progress=lambda done, total: progress.append((done, total)),
+            )
         self.assertIn(b"SEND", stream.outgoing)
         self.assertIn(b"DATA", stream.outgoing)
         self.assertIn(b"hello", stream.outgoing)
         self.assertIn(b"DONE", stream.outgoing)
+        self.assertEqual(progress[0], (0, 5))
+        self.assertEqual(progress[-1], (5, 5))
 
     def test_pull(self):
         path = "/sdcard/file.txt"
@@ -51,6 +58,34 @@ class SyncTests(unittest.TestCase):
             destination = Path(directory) / "pulled.txt"
             client.pull(path, str(destination))
             self.assertEqual(destination.read_bytes(), b"hello")
+
+    def test_pull_progress(self):
+        path = "/sdcard/file.txt"
+        data = b"hello"
+        name = b"file.txt"
+        stat_payload = struct.pack("<III", 0o100644, len(data), 123) + name
+        incoming = (
+            b"STAT"
+            + struct.pack("<I", len(stat_payload))
+            + stat_payload
+            + b"DATA"
+            + struct.pack("<I", len(data))
+            + data
+            + b"DONE"
+            + struct.pack("<I", 0)
+        )
+        stream = FakeStream(incoming)
+        client = SyncClient(stream)
+        progress = []
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "pulled.txt"
+            client.pull(
+                path,
+                str(destination),
+                progress=lambda done, total: progress.append((done, total)),
+            )
+        self.assertEqual(progress[0], (0, 5))
+        self.assertEqual(progress[-1], (5, 5))
 
     def test_stat(self):
         name = b"file.txt"

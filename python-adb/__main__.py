@@ -11,11 +11,12 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Callable, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 from termuxadb import __version__
-from termuxadb.adb.crypto import RsaKey
+from termuxadb.adb.crypto import RsaKey, default_key_path
 from termuxadb.adb.sync import pull_file, push_file
 from termuxadb.adb.transport import AdbConnection
 from termuxadb.usb.broker import main as broker_main
@@ -32,7 +33,6 @@ USAGE = """用法: py-adb 命令
 通过 Termux USB 使用 ADB。
 
 命令:
-  key                     显示 ADB 公钥指纹
   start                   启动后台守护进程
   status                  显示守护进程和设备状态
   devices                 列出 ADB 设备
@@ -64,17 +64,16 @@ def error_text(exc: Exception) -> str:
         return "等待 USB 权限超时，请允许 Termux 的 USB 访问请求"
     if "USBDEVFS_CLAIMINTERFACE" in text and "busy" in text:
         return "USB 接口被占用，请先停止 adb 或 termux-adb 服务"
+    if "timed out waiting for ADB OKAY" in text:
+        return "等待 ADB 确认超时"
+    if "USBDEVFS_BULK" in text:
+        return "USB 批量传输失败: " + text
+    if "unexpected sync " in text:
+        return "同步协议响应异常: " + text
     return text
 
 
-def show_key() -> int:
-    key = RsaKey.load_or_create()
-    values = fingerprints(key)
-    print(f"密钥 SHA256={values['sha256']} MD5={values['md5']} 用户={key.comment}")
-    return 0
-
-
-def open_adb() -> tuple[AdbConnection, object]:
+def open_adb(key: Optional[RsaKey] = None) -> tuple[AdbConnection, object]:
     paths = list_usb_devices()
     if not paths:
         raise RuntimeError("未找到 USB 设备")
@@ -96,7 +95,7 @@ def open_adb() -> tuple[AdbConnection, object]:
             raise RuntimeError("发现多个 ADB USB 设备，请拔掉多余的设备")
         info, usbfs = probes[0]
         transport = open_transport_from_info(usbfs, info, "adb")
-        key = RsaKey.load_or_create()
+        key = key or RsaKey.load_or_create()
         connection = AdbConnection(transport, key)
         state = connection.connect(30.0)
         if state.state != "device":
@@ -134,13 +133,23 @@ def send_json(sock: socket.socket, value: dict) -> None:
     sock.sendall(struct.pack(">I", len(body)) + body)
 
 
-def request(payload: dict, timeout: float = 30.0) -> dict:
+def request(
+    payload: dict,
+    timeout: float = 30.0,
+    progress: Optional[Callable[[dict], None]] = None,
+) -> dict:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(timeout)
     try:
         sock.connect(str(SOCKET_PATH))
         send_json(sock, payload)
-        return recv_json(sock)
+        while True:
+            message = recv_json(sock)
+            if "progress" in message:
+                if progress is not None:
+                    progress(message["progress"])
+                continue
+            return message
     finally:
         sock.close()
 
@@ -153,13 +162,15 @@ def run_daemon() -> int:
         pass
     key = RsaKey.load_or_create()
     key_ids = fingerprints(key)
-    connection, info = open_adb()
+    key_file = str(default_key_path())
+    connection, info = open_adb(key)
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(SOCKET_PATH))
     os.chmod(SOCKET_PATH, 0o600)
     server.listen(4)
     print(
         f"守护进程就绪 {info.display_serial} "
+        f"密钥文件={key_file} "
         f"密钥 SHA256={key_ids['sha256']} MD5={key_ids['md5']}",
         flush=True,
     )
@@ -179,6 +190,7 @@ def run_daemon() -> int:
                             "path": info.path,
                             "key_sha256": key_ids["sha256"],
                             "key_md5": key_ids["md5"],
+                            "key_file": key_file,
                         },
                     )
                 elif op == "reboot":
@@ -198,12 +210,26 @@ def run_daemon() -> int:
                 elif op == "push":
                     local_path = str(request_value.get("local") or "")
                     remote_path = str(request_value.get("remote") or "")
-                    push_file(connection, local_path, remote_path)
+
+                    def progress(done: int, total: int) -> None:
+                        try:
+                            send_json(client, {"progress": {"done": done, "total": total}})
+                        except OSError:
+                            pass
+
+                    push_file(connection, local_path, remote_path, progress=progress)
                     send_json(client, {"ok": True})
                 elif op == "pull":
                     remote_path = str(request_value.get("remote") or "")
                     local_path = str(request_value.get("local") or "")
-                    pull_file(connection, remote_path, local_path)
+
+                    def progress(done: int, total: int) -> None:
+                        try:
+                            send_json(client, {"progress": {"done": done, "total": total}})
+                        except OSError:
+                            pass
+
+                    pull_file(connection, remote_path, local_path, progress=progress)
                     send_json(client, {"ok": True})
                 elif op == "shell":
                     command = str(request_value.get("command") or "")
@@ -240,17 +266,20 @@ def run_daemon() -> int:
         connection.close()
 
 
-def request_started(payload: dict, timeout: float = 30.0) -> dict:
+def request_started(
+    payload: dict,
+    timeout: float = 30.0,
+    progress: Optional[Callable[[dict], None]] = None,
+) -> dict:
     try:
-        return request(payload, timeout)
+        return request(payload, timeout, progress)
     except (FileNotFoundError, ConnectionRefusedError):
         start_daemon(quiet=True)
-        return request(payload, timeout)
+        return request(payload, timeout, progress)
 
 
 def show_start_result(status: dict) -> None:
-    print(f"设备状态: {status.get('state', '?')}")
-    print("守护进程启动成功")
+    print(f" - 守护进程已启动 [设备状态: {status.get('state', '?')}]")
 
 
 def start_daemon(quiet: bool = False) -> int:
@@ -317,36 +346,55 @@ def interactive_shell() -> int:
         print(result.get("output", ""), end="")
 
 
-def list_devices() -> int:
-    try:
-        status = request({"op": "status"}, 1.0)
-    except OSError:
-        status = None
-    if status is not None and status.get("ok"):
-        print(f"{status.get('state', '?')}: {status.get('serial', '?')}")
-        return 0
+def format_bytes(value: int) -> str:
+    size = float(max(value, 0))
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GiB"
 
-    rows: list[str] = []
-    for path in list_usb_devices():
-        try:
-            info, usbfs = probe_device(path)
-        except Exception:
-            continue
-        try:
-            if "adb" in info.modes:
-                rows.append(f"offline: {info.display_serial}")
-        finally:
-            usbfs.close()
-    for row in rows:
-        print(row)
+
+class ProgressBar:
+    def __init__(self, label: str):
+        self.label = label
+        self.started = False
+
+    def update(self, value: dict) -> None:
+        done = int(value.get("done", 0))
+        total = int(value.get("total", 0))
+        self.started = True
+        if total > 0:
+            ratio = min(done / total, 1.0)
+            width = 30
+            filled = int(ratio * width)
+            bar = "#" * filled + "-" * (width - filled)
+            line = (
+                f"{self.label} {ratio * 100:3.0f}% [{bar}] "
+                f"{format_bytes(done)}/{format_bytes(total)}"
+            )
+        else:
+            line = f"{self.label} {format_bytes(done)}"
+        print(f"\r{line}", end="", flush=True)
+
+    def finish(self) -> None:
+        if self.started:
+            print()
+            self.started = False
+
+
+def list_devices() -> int:
+    status = request_started({"op": "status"}, 10.0)
+    print(f"{status.get('state', '?')}: {status.get('serial', '?')}")
     return 0
 
 
 def show_status() -> int:
-    status = request({"op": "status"}, 10.0)
+    status = request_started({"op": "status"}, 10.0)
     print(f"设备状态: {status.get('state', '?')}")
     print(f"序列号: {status.get('serial', '?')}")
     print(f"USB 路径: {status.get('path', '?')}")
+    print(f"密钥文件: {status.get('key_file', '?')}")
     print(f"密钥 SHA256: {status.get('key_sha256', '?')}")
     print(f"密钥 MD5: {status.get('key_md5', '?')}")
     return 0
@@ -363,8 +411,6 @@ def main() -> int:
         if command in ("version", "--version"):
             print(f"py-adb {__version__}")
             return 0
-        if command == "key":
-            return show_key()
         if command == "daemon":
             return run_daemon()
         if command == "start":
@@ -379,11 +425,7 @@ def main() -> int:
             print(f"已发送重启命令: {target or '系统'}")
             return 0
         if command == "status":
-            try:
-                return show_status()
-            except OSError:
-                print("py-adb: 守护进程未运行，请先执行 py-adb start", file=sys.stderr)
-                return 1
+            return show_status()
         if command == "shell":
             if len(sys.argv) == 2:
                 return interactive_shell()
@@ -399,7 +441,11 @@ def main() -> int:
                 payload = {"op": "push", "local": sys.argv[2], "remote": sys.argv[3]}
             else:
                 payload = {"op": "pull", "remote": sys.argv[2], "local": sys.argv[3]}
-            result = request_started(payload, 120.0)
+            bar = ProgressBar("推送" if command == "push" else "拉取")
+            try:
+                result = request_started(payload, 120.0, bar.update)
+            finally:
+                bar.finish()
             if not result.get("ok"):
                 raise RuntimeError(result.get("error", "推送失败" if command == "push" else "拉取失败"))
             print("推送成功" if command == "push" else "拉取成功")
